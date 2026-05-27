@@ -1,12 +1,13 @@
 from datawhisperer_bioinstruct_pruner import DataWhisperer_BioInstruct_Pruner
 from datawhisperer_dialog_pruner import DataWhisperer_Dialog_Pruner
 from datawhisperer_gsm_pruner import DataWhisperer_GSM_Pruner
-from datawhisperer_qwen2_5_vl_pruner import DataWhisperer_Qwen2_5VL_Pruner
+# from datawhisperer_qwen2_5_vl_pruner import DataWhisperer_Qwen2_5VL_Pruner
 import argparse
 import time
 import torch
 import threading
 import os
+import json
 
 def get_pruner(dataset, method='datawhisperer'):
     if  method == 'datawhisperer':
@@ -14,18 +15,24 @@ def get_pruner(dataset, method='datawhisperer'):
             "bioinstruct": DataWhisperer_BioInstruct_Pruner,
             "dialogsum": DataWhisperer_Dialog_Pruner,
             "gsm8k": DataWhisperer_GSM_Pruner,
-            "llava_1k": DataWhisperer_Qwen2_5VL_Pruner,
+            # "llava_1k": DataWhisperer_Qwen2_5VL_Pruner,
         }
     return pruner_map.get(dataset)
 
-def monitor_cuda_memory(stop_event, peak_memory_list, device_index=0):
+def monitor_cuda_memory(stop_event, peak_memory_dict, device_index=0):
     device = torch.device(f"cuda:{device_index}")
-    peak_memory = 0
+    peak_memory_allocated = 0
+    peak_memory_reserved = 0
     while not stop_event.is_set():
-        current_memory = torch.cuda.memory_allocated(device) / 1024**2 
-        peak_memory = max(peak_memory, current_memory)
+        current_memory_allocated = torch.cuda.memory_allocated(device) / 1024**2 
+        current_memory_reserved = torch.cuda.memory_reserved(device) / 1024**2
+        if current_memory_allocated > peak_memory_allocated:
+            peak_memory_allocated = current_memory_allocated
+        if current_memory_reserved > peak_memory_reserved:
+            peak_memory_reserved = current_memory_reserved
         time.sleep(0.1)  
-    peak_memory_list.append(peak_memory)
+    peak_memory_dict['memory_allocated'] = peak_memory_allocated
+    peak_memory_dict['memory_reserved'] = peak_memory_reserved
 
 def run_pruning(args):
     Pruner = get_pruner(args.dataset, args.method)
@@ -67,8 +74,12 @@ if __name__ == "__main__":
         raise RuntimeError("CUDA is not available. Please check your GPU and PyTorch installation.")
 
     stop_event = threading.Event()
-    peak_memory_list = []
-    monitor_thread = threading.Thread(target=monitor_cuda_memory, args=(stop_event, peak_memory_list, args.gpu_index))
+    memory_dict = {}
+    monitor_thread = threading.Thread(
+        target=monitor_cuda_memory,
+        args=(stop_event, memory_dict, args.gpu_index),
+        daemon=True,
+    )
     monitor_thread.start()
 
     start_time = time.time()
@@ -78,11 +89,17 @@ if __name__ == "__main__":
     stop_event.set()
     monitor_thread.join()
 
-    peak_memory_mb = peak_memory_list[0] if peak_memory_list else 0
-    memory_output_file = os.path.join(args.output_filtered_path, "cuda_memory_usage.txt")
-    with open(memory_output_file, 'w') as f:
-        f.write(f"Peak CUDA memory allocated (GPU {args.gpu_index}): {peak_memory_mb:.2f} MB\n")
-        f.write(f"Execution time: {execution_time:.2f} seconds\n")
+    # peak_memory_mb = peak_memory_list[0] if peak_memory_list else 0
+    memory_dict["peak_memory_allocated"] = torch.cuda.max_memory_allocated(args.gpu_index) / 1024**2
+    memory_dict["peak_memory_reserved"] = torch.cuda.max_memory_reserved(args.gpu_index) / 1024**2
+    memory_dict["execution_time_seconds"] = execution_time
+    memory_output_file = os.path.join(args.output_filtered_path, "cuda_memory_usage.json")
+    with open(memory_output_file, "w") as f:
+        json.dump(memory_dict, f, ensure_ascii=False, indent=2)
+    # with open(memory_output_file, 'w') as f:
+    #     f.write(f"Peak CUDA memory allocated (GPU {args.gpu_index}): {memory_dict['memory_allocated']:.2f} MB\n")
+    #     f.write(f"Peak CUDA memory reserved (GPU {args.gpu_index}): {memory_dict['memory_reserved']:.2f} MB\n")
+    #     f.write(f"Execution time: {execution_time:.2f} seconds\n")
 
-    print(f"Peak CUDA memory allocated (GPU {args.gpu_index}): {peak_memory_mb:.2f} MB saved to {args.memory_output_file}")
-    print(f"Execution time: {execution_time:.2f} seconds")
+    print(f"Memory info:\n{json.dumps(memory_dict, ensure_ascii=False, indent=2)}")
+    print(f"Memory usage and execution time saved to: {memory_output_file}")

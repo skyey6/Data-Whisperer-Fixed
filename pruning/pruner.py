@@ -19,6 +19,7 @@ class Pruner(ABC):
         self.accelerator = Accelerator()
         self.tokenizer = AutoTokenizer.from_pretrained(self.args.model_path, padding_side="left")
         self.tokenizer.pad_token = self.tokenizer.eos_token
+        # 这里加载模型的attn_implementation设置为"eager"，以确保能够获取attention scores（后续也许可以优化）
         self.model = AutoModelForCausalLM.from_pretrained(self.args.model_path, torch_dtype=torch.bfloat16, attn_implementation="eager")
         self.model = self.accelerator.prepare(self.model)
         # self.model = self.model.half()
