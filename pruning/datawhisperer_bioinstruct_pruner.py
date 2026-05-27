@@ -1,6 +1,8 @@
 import os
 import re
+import sys
 import time
+from tqdm.auto import tqdm
 from sklearn.model_selection import KFold
 import torch
 from utils.utils import save_json, timer_decorator
@@ -18,6 +20,14 @@ class DataWhisperer_BioInstruct_Pruner(Pruner):
     def __init__(self, args: Any) -> None:
         super().__init__(args)
         self.dataset = self.args.dataset
+        self.INVALID_INPUTS = [
+            "", "-", "n/a", "(n/a)", "none", "(none)", "(empty)", "(empty context)",
+            "not applicable", "(not applicable)",
+            "not required", "none required", "(no input required)", "(not required)", "(no specific input required)",
+            "none needed", "(no input needed)",
+            "(no specific input)", "(no specific input given)",
+            "(no input)", "(no input provided)", "(no input necessary)",
+        ]
 
     def generate_demonstrations(self, train_set, selected_indices, prompt_template):
         demonstrations = ""
@@ -101,7 +111,7 @@ class DataWhisperer_BioInstruct_Pruner(Pruner):
                     attention_mask,
                     input_embeds,
                     past_key_values=None,
-                    use_cache=False,
+                    use_cache=False, # 仅进行一次前向传播，不需要使用KV-cache
                     cache_position=cache_position,
                     output_attentions=True,
                 )
@@ -113,7 +123,8 @@ class DataWhisperer_BioInstruct_Pruner(Pruner):
                     cache_position=cache_position,
                     output_attentions=True,
                 )
-                
+            # self.accelerator.print(f"{self.model.model.config.model_type=}", flush=True) # self.model.model.config.model_type='llama'
+            # self.accelerator.print(causal_mask.shape, causal_mask.dtype, flush=True) # torch.Size([1, 1, 692, 692]) torch.bfloat16
             hidden_states = input_embeds
             if self.model.model.config.model_type == "mistral":
                 position_embeds = self.model.model.layers[0].self_attn.rotary_emb(hidden_states, position_ids)
@@ -122,6 +133,7 @@ class DataWhisperer_BioInstruct_Pruner(Pruner):
 
             attention = None
 
+            # 前向执行到指定的层，获取该层的attention scores
             for i, layer in enumerate(self.model.model.layers[: self.model.model.config.num_hidden_layers]):  # self.model.model.layers[: self.model.model.config.num_hidden_layers]
                 if i == layer_index:
                     # Run forward pass for this layer only(including attention mechanism)
@@ -144,7 +156,14 @@ class DataWhisperer_BioInstruct_Pruner(Pruner):
                             use_cache=False,
                             output_attentions=True,
                         )
-                        
+                    # 这里的layer_output[1]是该层的attn_weights，已经过softmax，shape是[B, num_heads, seq_len, seq_len]
+                    # self.accelerator.print(f"Layer {i} attention weights shape: {layer_output[1].shape}", flush=True) # torch.Size([1, 32, 692, 692])
+                    # last_token = layer_output[1][:, :, -1, :]  # [B, num_heads, seq_len]
+                    # self.accelerator.print(f"{last_token.shape}", flush=True) # torch.Size([1, 32, 692])
+                    # temp = last_token.sum(dim=-1)
+                    # 每个head上最后一个token的attention weights之和都是1
+                    # self.accelerator.print(f"Layer {i} attention weights for the last token after summing over dim=-1: {temp}", flush=True)
+                    # 这里把attention weights在head维度上求和，shape是[B, seq_len, seq_len]
                     attention = torch.sum(layer_output[1], dim=1).to(dtype=torch.float16)
                     break
 
@@ -181,18 +200,16 @@ class DataWhisperer_BioInstruct_Pruner(Pruner):
         prompts_comp = []
         prompt_template, instruction, val_inst, task_inst = DATASET_PROMPTS[f'{self.args.model_type}_{self.args.dataset}']
 
+        # self.accelerator.print(batch_demonstrations, flush=True)
+        # self.accelerator.print(batch_val_samples, flush=True)
+        # raise ValueError("Debugging stop")
         for demonstrations, val_samples in zip(batch_demonstrations, batch_val_samples):
             # Prepare prompts for each batch
 
             all_texts = []
             for i, sample in enumerate(val_samples):
-                if sample["input"] and sample["input"].strip().upper() not in [
-                    "",
-                    "N/A",
-                    "Not applicable",
-                    "-",
-                    "(No input needed)",
-                ]:
+                # bug fixed, 补充了之前漏掉的一些input缺失的情况
+                if sample["input"] and sample["input"].strip().rstrip('.').casefold() not in self.INVALID_INPUTS:
                     all_texts.append(
                         f'Question {i + 1}: Instruction: "{sample["instruction"]}" Input: "{sample["input"]}"'
                     )
@@ -201,6 +218,7 @@ class DataWhisperer_BioInstruct_Pruner(Pruner):
                         f'Question {i + 1}: Instruction: "{sample["instruction"]}"'
                     )
 
+            # Construct the final prompt
             inst, demo, response = (
                 instruction,
                 demonstrations,
@@ -209,7 +227,7 @@ class DataWhisperer_BioInstruct_Pruner(Pruner):
 
             prompt = inst + demo + response
 
-            prompts.append(prompt)
+            prompts.append(prompt) # 将构造好的prompt（字符串）添加到prompts列表中
             prompts_comp.append([inst, demo, response])
 
         # Generate in batch
@@ -222,7 +240,7 @@ class DataWhisperer_BioInstruct_Pruner(Pruner):
                 padding="longest",
                 max_length=self.args.max_token,
             ).to(self.accelerator.device)
-            prompt_length = encoding.input_ids.size(1)
+            prompt_length = encoding.input_ids.size(1) # size() -> (b, s)
             max_new_tokens = self.args.max_token - prompt_length
             if max_new_tokens <= 0:
                 self.accelerator.print(f"{max_new_tokens}:max_new_tokens<0", flush=True)
@@ -232,17 +250,22 @@ class DataWhisperer_BioInstruct_Pruner(Pruner):
             outputs = self.model.generate(
                 **encoding,
                 max_new_tokens=max_new_tokens,
-                temperature=0,
                 do_sample=False,
                 pad_token_id=self.tokenizer.eos_token_id,
             )
+        # self.accelerator.print(f"{outputs.shape=}", flush=True) # outputs.shape=torch.Size([1, 1121])
+        # self.accelerator.print(f"{outputs=}", flush=True)
         # Decode batch outputs
         generated_texts = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        # generated_texts是一个列表，包含每个prompt对应的生成文本字符串
+        # self.accelerator.print(f"{generated_texts=}", flush=True)
         # Extract predictions for each batch
         batch_predictions = []
         for generated_text, val_samples in zip(generated_texts, batch_val_samples):
             responses_section = generated_text.split("assistant")[-1].strip()
+            # 这里利用正则表达式从生成的文本中提取出模型回答的部分，以list的式返回
             predictions = self.extract_predictions(responses_section)
+            # self.accelerator.print(f"{predictions=}", flush=True)
             batch_predictions.append(predictions)
 
         if return_attention_scores:
@@ -250,7 +273,8 @@ class DataWhisperer_BioInstruct_Pruner(Pruner):
             if self.args.attn_layer is not None:
                 layer = self.args.attn_layer
             else:
-                if self.args.model_name == "Meta-Llama-3-8B-Instruct" or self.args.model_name == "Mistral-Nemo-Instruct-2407":
+                # 取middle layer的attention score
+                if self.args.model_name == "Llama-3-8B-Instruct" or self.args.model_name == "Mistral-Nemo-Instruct-2407":
                     layer = 13
                 elif self.args.model_name == "Qwen2.5-3B-Instruct" or self.args.model_name == "Qwen2.5-7B-Instruct":
                     layer = 16
@@ -258,12 +282,12 @@ class DataWhisperer_BioInstruct_Pruner(Pruner):
                     layer = 10
                 else:
                     layer = 11
-
+            # 这里会进行一次额外的前向传播来获取attention scores，后续可以考虑优化
             attn_score = self.get_attn_score(
                 input_ids=encoding.input_ids,
                 attention_mask=encoding.attention_mask,
                 layer_index=layer,            
-            )
+            ) # attn_score shape is [B, seq_len, seq_len]
                 
             attn_layer = []
 
@@ -280,7 +304,7 @@ class DataWhisperer_BioInstruct_Pruner(Pruner):
                             max_length=self.args.max_token,
                         )
                     )
-                    - 1
+                    - 1 # 减1去掉了tokenizer自动添加的bos_token的长度
                 )
                 n_d = (
                     len(
@@ -316,30 +340,34 @@ class DataWhisperer_BioInstruct_Pruner(Pruner):
                     - 1
                     for _demo in demo_list
                 ]
+                # <--- n_d = sum(demo_len) --->
+                # self.accelerator.print(f'{n_d=}') # n_d=361
+                # self.accelerator.print(f'{demo_len=}') # demo_len=[105, 64, 40, 80, 72], sum=361
 
                 try:
                     pad_pos = (
                         torch.nonzero(1 - encoding.attention_mask[idx].squeeze())
                         .squeeze()[-1]
                         .item()
-                    )
+                    )# 取到最后一个padding token的位置索引，之后的token都是有效的输入（padding_side="left"）
+                    # attn_score shape is [B, seq_len, seq_len]
                     attn = attn_score[idx, pad_pos + 1 :, pad_pos + 1 :]
                 except:
                     attn = attn_score[idx]
 
                 demo_to_response = attn[
                     n_i + n_d : n_i + n_d + n_r, n_i : n_i + n_d
-                ] 
+                ] # 获取Query部分对Demonstration部分的attention scores，shape是[n_r, n_d]
 
                 demo_attn = []
                 demo_idx = 0
                 for i in range(len(demo_list)):
                     single_demo_to_response = demo_to_response[
                         :, demo_idx : demo_idx + demo_len[i]
-                    ]
+                    ] # 获取Query部分对单个Demonstration的attention scores
 
                     demo_attn.append(
-                        single_demo_to_response.sum() / (demo_len[i] * n_r)
+                        single_demo_to_response.sum() / (demo_len[i] * n_r) # 正则化，避免长度影响
                     )
 
                     demo_idx += demo_len[i]
@@ -371,10 +399,14 @@ class DataWhisperer_BioInstruct_Pruner(Pruner):
             assert (
                 val_set is None
             ), "Validation set should not be provided for k-fold evaluation"
-            # Create K-Fold splits
+            # Create K-Fold splits, default k=2
             kf = KFold(n_splits=self.args.k_folds, shuffle=True, random_state=42)
             folds = list(kf.split(dataset))
-            for fold_idx, (train_idx, val_idx) in enumerate(folds):
+            pbar = tqdm(folds, desc="KFold", disable=not self.accelerator.is_main_process)
+            # len(train_idx)  -->   11252
+            # type(train_idx) -->   <class 'numpy.ndarray'>
+            # train_idx[:5]   -->   [ 1  2  7  9 10]
+            for fold_idx, (train_idx, val_idx) in enumerate(pbar):
                 # Extract train and validation sets
                 train_set = [dataset[i] for i in train_idx]
                 val_set = [dataset[i] for i in val_idx]
@@ -392,6 +424,7 @@ class DataWhisperer_BioInstruct_Pruner(Pruner):
                     train_idx = torch.tensor(
                         train_idx, dtype=torch.int32, device=score.device
                     )
+                # 把当前fold中的local_score和local_count中的值累加到score和count中对应样本的位置上
                 score.index_add_(0, train_idx, local_score)
                 count.index_add_(0, train_idx, local_count)
                 # judge whether the two methods are the same
@@ -454,6 +487,8 @@ class DataWhisperer_BioInstruct_Pruner(Pruner):
 
         # Prepare model and data with accelerator
         train_set, val_set = self.accelerator.prepare(train_set, val_set)
+        # print(type(train_set)) # train_set type: <class 'list'>
+        # return
         prompt_template, _, _, _ = DATASET_PROMPTS[f'{self.args.model_type}_{self.args.dataset}']
 
         # Generate training and validation batch indices
@@ -472,6 +507,8 @@ class DataWhisperer_BioInstruct_Pruner(Pruner):
 
         metric_function = METRICS[self.args.metric]
 
+        pbar = tqdm(total=len(train_batches), leave=False ,disable=not self.accelerator.is_main_process)
+
         while train_pointer < len(train_batches):
             batch_demonstrations = []
             batch_val_samples = []
@@ -487,15 +524,20 @@ class DataWhisperer_BioInstruct_Pruner(Pruner):
                 start_train_idx, end_train_idx = train_batches[train_pointer]
                 selected_indices = list(range(start_train_idx, end_train_idx))
                 batch_selected_indices.append(selected_indices)
+                # self.accelerator.print(f"Selected indices for current batch: {selected_indices}")
+                # return                 # Selected indices for current batch: [0, 1, 2, 3, 4]
 
                 # Get validation batch indices
                 start_test_idx, end_test_idx = val_batches[val_pointer]
                 test_batch = val_set[start_test_idx:end_test_idx]
 
                 # Generate demonstrations
+                # TODO: 这里demosration是否也要判断input是否存在
                 demonstrations, demo_list = self.generate_demonstrations(
                     train_set, selected_indices, prompt_template
                 )
+                # demonstrations是多个example拼接成的字符串，
+                # demo_list是一个list，每个元素是一个example对应的demonstration字符串
                 batch_demonstrations.append(demonstrations)
                 batch_demo_list.append(demo_list)
                 batch_val_samples.append(test_batch)
@@ -504,6 +546,10 @@ class DataWhisperer_BioInstruct_Pruner(Pruner):
                 val_pointer = (val_pointer + 1) % len(val_batches)
 
             # Generate predictions for the current batch
+            # `batch_predictions`是List[List[str]]，外层List长度=parallel_batches，
+            # 内层List长度=batch_test（validation samples的个数），每个元素是模型生成的对应validation sample的回答字符串；
+            # `batch_attention_scores`是List[List[float]]，外层List长度=parallel_batches，
+            # 内层List长度=batch_train（demonstration的个数），每个元素是对应demonstration的attention得分
             batch_predictions, batch_attention_scores = self.predict_batch(
                 batch_demonstrations,
                 batch_val_samples,
@@ -525,6 +571,7 @@ class DataWhisperer_BioInstruct_Pruner(Pruner):
                         attention_scores, dtype=torch.float16, device=score.device
                     )
 
+                # Normalize attention scores to get weights
                 weight = attention_scores / attention_scores.sum()
                 
                 if len(predictions) != len(references):
@@ -535,7 +582,11 @@ class DataWhisperer_BioInstruct_Pruner(Pruner):
                         continue
 
                 for pred, ref in zip(predictions, references):
-                    pred_score = metric_function(pred, ref)
+                    # 给模型生成的每个结果打分
+                    # TODO: pred和ref的位置好像反了？
+                    # pred_score = metric_function(pred, ref)
+                    # FIXED
+                    pred_score = metric_function(ref, pred)
                     if not isinstance(selected_indices, torch.Tensor):
                         # print('indices is not tensor')
                         selected_indices = torch.tensor(
@@ -547,10 +598,16 @@ class DataWhisperer_BioInstruct_Pruner(Pruner):
                             [pred_score], dtype=torch.float16, device=score.device
                         ).expand(len(selected_indices))
 
+                    # 根据每个demo样本的attention权重，计算每个其对应的加权分数
                     weighted_scores = pred_score * weight
 
+                    # 这里用`index_add_`也可以达到同样的效果
                     score.scatter_add_(0, selected_indices, weighted_scores)
-
+                # 每有一个Query样本，demo样本就会获得一轮打分，这里统计每个被选中的demo样本在这个batch中获得打分的次数
                 count[selected_indices] += len(references)
+            
+            # 更新进度条
+            processed_batch = len(batch_demonstrations)
+            pbar.update(processed_batch)
         
         print(f"Failed batches: {fail}")
