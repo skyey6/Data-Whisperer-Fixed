@@ -6,3 +6,4 @@
 !model/.gitkeep
 model/*
 results/*
+*/test.*
