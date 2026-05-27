@@ -3,3 +3,6 @@
 *.txt
 *.png
 *.pdf
+!model/.gitkeep
+model/*
+results/*

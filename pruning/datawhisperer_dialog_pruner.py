@@ -437,7 +437,10 @@ class DataWhisperer_Dialog_Pruner(Pruner):
                         continue
 
                 for pred, ref in zip(predictions, references):
-                    pred_score = metric_function(pred, ref)
+                    # TODO: pred和ref的位置好像反了？
+                    # pred_score = metric_function(pred, ref)
+                    # FIXED
+                    pred_score = metric_function(ref, pred)
                     if not isinstance(selected_indices, torch.Tensor):
                         # print('indices is not tensor')
                         selected_indices = torch.tensor(

@@ -389,7 +389,7 @@ class DataWhisperer_GSM_Pruner(Pruner):
         ]
 
         # Define output path based on whether K-fold is used
-        output_path = os.path.join(self.args.output_filtered_path, f"dat_whisperer.json")
+        output_path = os.path.join(self.args.output_filtered_path, f"data_whisperer.json")
 
         # Save results to JSON file
         save_json(output_path, sorted_dataset_with_scores)
